@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="A StochTune project write-up on numeric sampling, batch KL rewards, and matching distributions over generated text.">
+  <meta name="theme-color" content="#ffffff">
+  <title>Controlling stochasticity in language models — Yash Solanki</title>
+  <link rel="icon" href="../../assets/images/favicon.png" type="image/png">
+  <script src="../../assets/theme.js"></script>
+  <link rel="stylesheet" href="../../assets/site.css">
+  <script>
+    window.MathJax = {
+      loader: {load: ['a11y/assistive-mml']},
+      options: {enableMenu: false}
+    };
+  </script>
+  <script src="../../assets/mathjax/tex-chtml.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <div class="wrap header-inner">
+      <a class="wordmark" href="../../">Yash Solanki</a>
+      <nav aria-label="Main navigation">
+        <a href="../../#projects">Projects</a>
+        <a href="../" aria-current="location">Writing</a>
+        <a href="../../photos/">Photos</a>
+      </nav>
+      <button class="theme-toggle" type="button" aria-label="Dark theme" aria-pressed="false" title="Toggle light and dark themes" hidden>
+        <span class="theme-icon" aria-hidden="true"></span>
+      </button>
+    </div>
+  </header>
+
+  <main id="main" class="wrap">
+    <article class="article-wrap">
+      <a class="text-link" href="../">All posts</a>
+      <header class="post-header">
+        <h1>Controlling stochasticity in language models</h1>
+        <p class="post-dek">What it takes to train a model whose samples follow a target distribution.</p>
+      </header>
+
+      <div class="prose">
+        <h2 id="numeric-sampling">Learning to sample random numbers</h2>
+        <p>Suppose the prompt asks for a draw from a standard normal distribution. An answer of \(0.42\) looks plausible on its own. If the model gives \(0.42\) on every call, all its probability is concentrated at a single value. I started with numbers because I could specify the target exactly and use a standard sampler to check how close the model got. I trained Qwen2.5-3B in two stages, starting with supervised fine-tuning (SFT) and then scoring batches of its own draws with reinforcement learning (RL).</p>
+
+        <p>The model generates a string \(y\) with probability \(\pi_\theta(y\mid c)\), where \(c\) is the prompt. A parser \(f\) returns a number or marks the result invalid. The model’s probability of drawing \(x\) is the sum over all strings that parse to it.</p>
+        <div class="equation" tabindex="0" role="group" aria-label="Model distribution over numeric outputs">
+          \[
+          q_\theta(x\mid c)=\sum_{y:f(y)=x}\pi_\theta(y\mid c).
+          \]
+        </div>
+
+        <h3>Supervised fine-tuning with repeated draws</h3>
+        <p>I generated 32 independent draws for each of 2,000 parameter settings, for 64,000 training examples. Each draw became a canonical numeric string, with five decimal places for continuous draws and an integer for discrete draws. Weibull and Poisson were held out. Repeating the same prompt with different correct answers gives the model evidence about how often each answer should occur.</p>
+        <p>At a fixed prompt, let \(p_{\mathrm{fmt}}\) denote the target distribution over those formatted completions. The population sequence cross-entropy decomposes as</p>
+        <div class="equation" tabindex="0" role="group" aria-label="Cross-entropy and forward KL decomposition">
+          \[
+          \begin{aligned}
+          \mathcal L_{\mathrm{SFT}}(c)
+            &amp;= \mathbb E_{y\sim p_{\mathrm{fmt}}}
+                \bigl[-\log\pi_\theta(y\mid c)\bigr] \\
+            &amp;= H(p_{\mathrm{fmt}})
+                + D_{\mathrm{KL}}\bigl(p_{\mathrm{fmt}}\,\|\,\pi_\theta\bigr).
+          \end{aligned}
+          \]
+        </div>
+
+        <p>The entropy term is fixed by the target. Reducing cross-entropy therefore pushes the model toward the target frequencies over completions. I used completion-token cross-entropy, including the end token, so the model could also learn where to stop. An ideal fit here would match the distribution at the precision used to format the training examples.</p>
+
+        <h3>A reward for the whole batch</h3>
+        <p>SFT sees draws from the target. I wanted the next stage to score draws from the model itself. A finite list of generated numbers gives me counts, whereas a continuous target gives me a density. Binning gives them a common set of categories. For a bin \(B_j=(a_j,b_j]\), the target mass follows from the target CDF \(F_c\).</p>
+        <div class="equation" tabindex="0" role="group" aria-label="Target bin probability">
+          \[
+          p_j(c)=\Pr(X\in B_j\mid c)=F_c(b_j)-F_c(a_j).
+          \]
+        </div>
+
+        <p>I started RL from the SFT checkpoint so the model already knew how to produce one number and stop. For each prompt I sampled \(N=256\) answers independently. Choosing bin boundaries by target quantiles gives each bin roughly the same expected count under a well-calibrated model. For example, the quartiles of a standard normal give four bins with 25% target mass each, or 64 expected draws per bin. For finite discrete distributions that fit the bin budget, I kept the exact categories.</p>
+        <p>Malformed, truncated, and out-of-support outputs went into an extra category. That category has zero target mass but still takes up mass in the model histogram. With counts \(n_j\) and pseudocount \(\alpha=0.1\), I used negative forward KL as the reward.</p>
+        <div class="equation" tabindex="0" role="group" aria-label="Smoothed histogram and numeric batch reward">
+          \[
+          \begin{aligned}
+          \widehat q_j
+            &amp;= \frac{n_j+\alpha}{N+\alpha(K+1)}, \\
+          R(c,Y_{1:N})
+            &amp;= -\sum_{j:p_j&gt;0} p_j\log\frac{p_j}{\widehat q_j}.
+          \end{aligned}
+          \]
+        </div>
+
+        <p>Here \(K\) is the number of numeric bins. Forward KL penalizes the model for giving very little probability to a bin the target uses. The pseudocount keeps an empty sampled bin from producing an infinite penalty. The reward sees how much mass lands in each bin, so I also measured KS and Wasserstein distance to check what happened inside the bins.</p>
+
+        <h3>Giving each draw credit</h3>
+        <p>REINFORCE needs to assign credit to each draw even though the reward depends on the whole batch. I recomputed the reward with draw \(i\) left out to get a baseline \(b_i\). Because that baseline depends only on the other independent draws, subtracting it preserves the expected policy gradient.</p>
+        <div class="equation" tabindex="0" role="group" aria-label="Leave-one-out policy gradient">
+          \[
+          \begin{aligned}
+          b_i &amp;= R(c,Y_{-i}), \\
+          \widehat g
+            &amp;= \sum_{i=1}^{N}(R-b_i)\,
+                \nabla_\theta\log\pi_\theta(Y_i\mid c).
+          \end{aligned}
+          \]
+        </div>
+
+        <p>The implementation multiplies the reward difference by \(N\) to offset averaging the sequence losses. It also subtracts a sequence KL penalty with weight \(\beta=0.02\) to limit drift from the frozen SFT checkpoint. The batch KL asks whether the numbers follow the target. The sequence KL asks how far the model has moved from its starting policy. The RL stage uses target bin probabilities and model-generated draws, so it needs no new labeled completions. <a href="https://github.com/YashSolanki2007/StochTune/blob/bdb20fbc070bdb8c4d7371ac3cee9fecd3512879/docs/implementation.md#batch-level-kl-reward-rl">Reward and credit assignment</a></p>
+
+        <h3>Numeric sampling results</h3>
+        <p>Fine-tuning raised the share of outputs that contained exactly one number and ended correctly from 6.84% to 98.68%. Median Kolmogorov–Smirnov (KS) distance to the target fell from 0.5428 to 0.1392. Median normalized Wasserstein distance fell from 1.6858 to 0.1122.</p>
+        <p>I tested each version on the same 100 held-out prompts with 1,000 independently generated answers per prompt. KS is the largest gap between the empirical and target cumulative distribution functions. I computed it over valid responses, so the four base-model prompts with zero valid answers are absent from its distance medians. A direct SciPy sampler reached a median KS of 0.025 with matched valid sample counts. <a href="https://github.com/YashSolanki2007/StochTune/blob/bdb20fbc070bdb8c4d7371ac3cee9fecd3512879/docs/sft-experiment.md">SFT methods and results</a></p>
+
+        <figure>
+          <img src="sft-results.png" width="2210" height="1530" decoding="async" alt="SFT improves numeric response validity and lowers median KS distance. Examples compare the cumulative distributions for a normal and a held-out Poisson prompt.">
+          <figcaption>Response validity, KS distance by distribution family, and two example cumulative distributions. <a href="sft-results.png">Full-size figure</a></figcaption>
+        </figure>
+
+        <p>After 250 RL updates, mean held-out histogram KL fell from 0.2277 to 0.2226, a 2.2% reduction. Median KS fell another 8.9%, from 0.1392 to 0.1268. Normal and uniform improved, while exponential and Weibull regressed. The pilot used a single seed. An equal-compute SFT continuation would help isolate what the batch reward contributed. <a href="https://github.com/YashSolanki2007/StochTune/blob/bdb20fbc070bdb8c4d7371ac3cee9fecd3512879/docs/kl-rl-experiment.md#findings-and-limits">Numeric RL results and limits</a></p>
+
+        <figure>
+          <img src="rl-vs-sft.png" width="1760" height="768" loading="lazy" decoding="async" alt="Numeric RL reduces average distribution errors relative to SFT. Median KS improves in six families and worsens for exponential and Weibull.">
+          <figcaption>The left panel compares aggregate metrics with SFT. The right panel shows the change in median KS by family, where negative values indicate improvement. <a href="rl-vs-sft.png">Full-size figure</a></figcaption>
+        </figure>
+
+        <h2 id="text-generation">Extending the reward to text</h2>
+        <p>For numeric draws, the prompt specifies the full target distribution. A text prompt rarely specifies how often each possible answer should appear, so the next experiments defined a target over features we could count or compare across samples.</p>
+
+        <h3>Choosing a target for passages</h3>
+        <p>For Shakespeare-style monologues, I used the frequency of adjacent word pairs in Tiny Shakespeare as the target. The reward \(G(\mathcal B)=-D_{\mathrm{KL}}(p\|\widehat q_{\mathcal B})\) compares the reference frequencies with the smoothed frequencies across generated passages in batch \(\mathcal B\). A frozen model scored each passage for coherence, fluency, and prompt fulfillment. The mean of those scores is \(\bar r_Q(\mathcal B)\). As in the numeric experiment, a separate sequence KL term limits drift from the starting policy \(\pi_0\).</p>
+        <div class="equation" role="group" aria-label="Passage quality and distribution objective" tabindex="0">
+          \[
+          J(\theta)=\mathbb E_{\mathcal C,\,\mathcal B\sim\pi_\theta}
+            \bigl[\bar r_Q(\mathcal B)+\lambda G(\mathcal B)\bigr]
+            -\beta\,\mathbb E_c D_{\mathrm{KL}}\!\left(\pi_\theta(\cdot\mid c)\|\pi_0(\cdot\mid c)\right).
+          \]
+        </div>
+
+        <p>The long bigram run lowered held-out bigram KL from 8.071 to 7.928 and raised the same judge’s mean quality score from 0.742 to 0.803. With longer generations, the model also supplies more word pairs to estimate the histogram. The repository rechecked the result with the same number of pairs per policy. The gap remained small. Since the quality scores came from the training judge, the comparison leaves human judgments open. <a href="https://github.com/YashSolanki2007/StochTune/blob/bdb20fbc070bdb8c4d7371ac3cee9fecd3512879/docs/passage-rl-experiment.md">Passage experiment notes</a></p>
+
+        <figure>
+          <img src="count-matched-kl.png" width="1567" height="758" loading="lazy" decoding="async" alt="Bigram KL decreases slightly after RL both at the original evaluation counts and with 6,136 sampled pairs per policy.">
+          <figcaption>The count-matched comparison averages 200 subsamples. Matching sample counts checks one source of bias in comparing the histograms. <a href="count-matched-kl.png">Full-size figure</a></figcaption>
+        </figure>
+
+        <p>I also tried matching single words. At a fixed 6,200 word observations per policy, unigram KL was 3.0598 for the starting model, 2.8589 after bigram training, and 2.7006 after unigram training. That is a clearer change in word frequencies. The two runs had different update counts, and a comparison across prompts left the difference in judge-rated quality uncertain. <a href="https://github.com/YashSolanki2007/StochTune/blob/bdb20fbc070bdb8c4d7371ac3cee9fecd3512879/results/passage-unigram-v1/README.md">Unigram experiment</a></p>
+
+        <h3>Comparing answers to the same question</h3>
+        <p>Pooling word counts hides which question each answer came from. In the broad HelpSteer experiment, the frozen quality score rose while the pooled word-frequency KL got worse. That motivated matching answers one question at a time in embedding space. <a href="https://github.com/YashSolanki2007/StochTune/blob/bdb20fbc070bdb8c4d7371ac3cee9fecd3512879/README.md#completed-broad-domain-and-programming-experiments">HelpSteer word-frequency results</a></p>
+        <p>I used squared maximum mean discrepancy (MMD) to compare generated answers with two reference answers for each question. For question \(q\), the \(n\) generated embeddings are \(Z_{qi}\) and the \(m\) reference embeddings are \(X_{qa}\). A kernel \(k\) measures similarity between embeddings.</p>
+        <div class="equation" role="group" aria-label="Conditional squared maximum mean discrepancy" tabindex="0">
+          \[
+          \widehat d_q=\frac{1}{n(n-1)}\sum_{i\ne j} k(Z_{qi},Z_{qj})
+            +\frac{1}{m^2}\sum_{a,b}k(X_{qa},X_{qb})
+            -\frac{2}{nm}\sum_{i,a}k(Z_{qi},X_{qa}).
+          \]
+        </div>
+
+        <p>The terms compare generated answers to each other, references to each other, and generated answers to references. The generated term leaves out self-comparisons. The reference term includes them because the two reference answers define a fixed empirical target. On 19 test questions, the first run lowered MMD from 0.3922 to 0.3833 and moved the quality score from 0.6696 to 0.6631. Both changes had paired-bootstrap intervals that included zero. <a href="https://github.com/YashSolanki2007/StochTune/blob/bdb20fbc070bdb8c4d7371ac3cee9fecd3512879/experiments/helpsteer-semantic-mmd/README.md">Conditional MMD experiment</a></p>
+
+        <p>In a short follow-up, I used energy distance and set the quality reward to zero. The energy distance fell 3.8% on four training questions and rose 1.5% on four unseen validation questions. A separate audit of the saved answers found the same direction for word-frequency KL. Those are different metrics, and the small number of questions makes both comparisons tentative. <a href="https://github.com/YashSolanki2007/StochTune/tree/bdb20fbc070bdb8c4d7371ac3cee9fecd3512879/results/helpsteer-v1/word-frequency-audit">Word-frequency audit and data</a></p>
+
+        <figure>
+          <img src="word-frequency-comparison.png" width="2340" height="1296" loading="lazy" decoding="async" alt="Selected word frequencies before and after RL, alongside each question’s reference answers, for seen and unseen questions.">
+          <figcaption>This diagnostic plots frequent reference content words. The numerical audit includes the full word counts for each question. <a href="word-frequency-comparison.png">Full-size figure</a></figcaption>
+        </figure>
+
+        <h2 id="next-steps">What’s left to test</h2>
+        <p>For numbers, I’d compare batch-reward RL with more SFT at the same compute budget, use several seeds, and add a control that produces valid numbers at a comparable rate. I’d also run the implemented soft-target KL trainer, which uses a trie of formatted draws to construct a next-token target. That would let me compare the three training signals on the same evaluation. <a href="https://github.com/YashSolanki2007/StochTune/blob/bdb20fbc070bdb8c4d7371ac3cee9fecd3512879/docs/implementation.md">Training implementation</a></p>
+        <p>For text, I’d collect more reference answers per question, evaluate on more unseen prompts, and ask people to rate answer quality alongside the model judges. The repository also records a follow-up on Jane Austen’s <cite>Emma</cite>. Its source-text screening found a lower split-to-split unigram KL than Tiny Shakespeare under the same sampling protocol. The training run was pending in this snapshot, so the screening only tells us about the corpus. <a href="https://github.com/YashSolanki2007/StochTune/blob/bdb20fbc070bdb8c4d7371ac3cee9fecd3512879/README.md#emma-source-stability-and-the-submitted-word-kl-experiment">Emma experiment notes</a></p>
+
+        <h2 id="references">References</h2>
+        <p>The original controlled-stochasticity article prompted the numeric experiment. The other sources informed the choice of training methods, evaluation, and corpora. <a href="https://github.com/YashSolanki2007/StochTune/blob/bdb20fbc070bdb8c4d7371ac3cee9fecd3512879/README.md#references-and-acknowledgments">How each source informed StochTune</a></p>
+
+        <h3>Controlled sampling and distribution matching</h3>
+        <ul class="references">
+          <li>Kuriakose &amp; Baldelli. <a href="https://www.lesswrong.com/posts/upCrcE39aF63GoLJh/training-language-models-for-controlled-stochasticity-2">Training Language Models for Controlled Stochasticity</a>.</li>
+          <li>Baldelli et al. <a href="https://arxiv.org/abs/2605.11845">Probabilistic Calibration Is a Trainable Capability in Language Models</a>.</li>
+          <li>Diamant &amp; Trippe. <a href="https://arxiv.org/abs/2606.19496">Calibrating Generative Models to Feature Distributions with MMD Finetuning</a> and <a href="https://github.com/smithhenryd/cgm">author code</a>.</li>
+          <li>Gretton et al. <a href="https://jmlr.org/papers/v13/gretton12a.html">A Kernel Two-Sample Test</a>.</li>
+          <li>Sejdinovic et al. <a href="https://arxiv.org/abs/1207.6076">Equivalence of distance-based and RKHS-based statistics in hypothesis testing</a>.</li>
+        </ul>
+
+        <h3>Policy gradients and preference learning</h3>
+        <ul class="references">
+          <li>Williams. <a href="https://doi.org/10.1007/BF00992696">Simple statistical gradient-following algorithms for connectionist reinforcement learning</a>.</li>
+          <li>Ahmadian et al. <a href="https://arxiv.org/abs/2402.14740">Back to Basics: Revisiting REINFORCE Style Optimization for Learning from Human Feedback in LLMs</a>.</li>
+          <li>Bradley &amp; Terry. <a href="https://doi.org/10.1093/biomet/39.3-4.324">Rank Analysis of Incomplete Block Designs: I. The Method of Paired Comparisons</a>.</li>
+          <li>Ouyang et al. <a href="https://arxiv.org/abs/2203.02155">Training language models to follow instructions with human feedback</a>.</li>
+          <li>Hu et al. <a href="https://arxiv.org/abs/2106.09685">LoRA: Low-Rank Adaptation of Large Language Models</a>.</li>
+        </ul>
+
+        <h3>Quality evaluation and preference data</h3>
+        <ul class="references">
+          <li>Liu et al. <a href="https://arxiv.org/abs/2303.16634">G-Eval: NLG Evaluation using GPT-4 with Better Human Alignment</a>.</li>
+          <li>Zheng et al. <a href="https://arxiv.org/abs/2306.05685">Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena</a>.</li>
+          <li>Wang et al. <a href="https://arxiv.org/abs/2406.08673">HelpSteer2</a>, its <a href="https://huggingface.co/datasets/nvidia/HelpSteer2">dataset</a>, and <a href="https://arxiv.org/abs/2410.01257">HelpSteer2-Preference</a>.</li>
+          <li>Liu et al. <a href="https://arxiv.org/abs/2507.01352">Skywork-Reward-V2</a> and the <a href="https://huggingface.co/Skywork/Skywork-Reward-V2-Qwen3-8B">8B reward model</a>.</li>
+          <li><a href="https://arxiv.org/abs/2507.00769">LitBench preprint</a>, <a href="https://aclanthology.org/2026.eacl-long.362/">published paper</a>, <a href="https://huggingface.co/datasets/SAA-Lab/LitBench-Train">training data</a>, and <a href="https://huggingface.co/datasets/SAA-Lab/LitBench-Test">test release</a>.</li>
+        </ul>
+
+        <h3>Models, embeddings, and corpora</h3>
+        <ul class="references">
+          <li><a href="https://arxiv.org/abs/2412.15115">Qwen2.5 Technical Report</a> and checkpoints for <a href="https://huggingface.co/Qwen/Qwen2.5-3B">Qwen2.5-3B</a>, <a href="https://huggingface.co/Qwen/Qwen2.5-3B-Instruct">Qwen2.5-3B-Instruct</a>, and <a href="https://huggingface.co/Qwen/Qwen2.5-7B-Instruct">Qwen2.5-7B-Instruct</a>.</li>
+          <li>Reimers &amp; Gurevych. <a href="https://arxiv.org/abs/1908.10084">Sentence-BERT</a> and the <a href="https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2">all-MiniLM-L6-v2 model card</a>.</li>
+          <li>Karpathy. <a href="https://github.com/karpathy/char-rnn/tree/master/data/tinyshakespeare">Tiny Shakespeare</a>.</li>
+          <li>Austen. <a href="https://www.gutenberg.org/ebooks/158"><cite>Emma</cite></a> and the <a href="https://github.com/nltk/nltk_data/blob/5f09e470fe339e1a119dd174ca284129a3c7a5bb/packages/corpora/gutenberg.zip">pinned NLTK Gutenberg distribution</a>.</li>
+          <li>Eldan &amp; Li. <a href="https://arxiv.org/abs/2305.07759">TinyStories</a> and its <a href="https://huggingface.co/datasets/roneneldan/TinyStories">dataset</a>, considered during corpus selection.</li>
+          <li>Novikova, Dušek &amp; Rieser. <a href="https://arxiv.org/abs/1706.09254">The E2E Dataset</a> and <a href="https://github.com/tuetschek/e2e-dataset">author data</a>, also considered during corpus selection.</li>
+        </ul>
+
+        <h3>Related approaches</h3>
+        <ul class="references">
+          <li>Shao et al. <a href="https://arxiv.org/abs/2402.03300">DeepSeekMath</a>.</li>
+          <li>Zhang et al. <a href="https://arxiv.org/abs/2404.10859">Forcing Diffuse Distributions out of Language Models</a>.</li>
+          <li>Khalifa, Elsahar &amp; Dymetman. <a href="https://arxiv.org/abs/2012.11635">A Distributional Approach to Controlled Text Generation</a>.</li>
+          <li>Anschel et al. <a href="https://aclanthology.org/2025.emnlp-main.1649/">Group-Aware Reinforcement Learning for Output Diversity in Large Language Models</a>.</li>
+          <li>Kulkarni et al. <a href="https://arxiv.org/abs/2609.31644">MaD-RL: Matching Distributions for Calibrating LLMs with Reinforcement Learning</a>.</li>
+        </ul>
+      </div>
+
+      <footer class="post-footer"><a class="text-link" href="https://github.com/YashSolanki2007/StochTune">StochTune on GitHub</a></footer>
+    </article>
+  </main>
+
+  <footer class="site-footer wrap">
+    <a class="wordmark" href="../../">Yash Solanki</a>
+    <nav class="contact-links" aria-label="Social and contact links">
+      <a href="https://github.com/YashSolanki2007">GitHub</a>
+      <a href="https://www.linkedin.com/in/yashsolanki07">LinkedIn</a>
+      <a href="mailto:yashmpsolanki@gmail.com">Email</a>
+    </nav>
+  </footer>
+</body>
+</html>
