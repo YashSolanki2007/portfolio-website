@@ -201,6 +201,18 @@ h1 {
 .prose figure img { width: 100%; border-radius: .25rem; }
 .prose figcaption { margin-top: .55rem; color: var(--muted); font-size: .9rem; line-height: 1.5; }
 .prose code { font-family: var(--mono); font-size: .9em; }
+.results-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: .92rem;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.45;
+}
+.results-table caption { margin-bottom: .35rem; text-align: left; font-weight: 650; }
+.results-table :is(th, td) { padding: .48rem .3rem; border-bottom: 1px solid var(--line); text-align: right; }
+.results-table th:first-child { padding-left: 0; text-align: left; }
+.results-table td { white-space: nowrap; }
+.results-table tbody th { font-weight: 450; }
 .post-footer { margin-top: 1.85rem; padding-top: 1rem; border-top: 1px solid var(--line); }
 
 .equation {
